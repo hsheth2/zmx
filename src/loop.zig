@@ -414,9 +414,6 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
                     const broadcast_data = util.rewritePromptRedraw(gpa, buf[0..n]) orelse buf[0..n];
                     defer if (broadcast_data.ptr != buf[0..n].ptr) gpa.free(broadcast_data);
                     for (daemon.clients.items) |client| {
-                        // A status watcher reads only status, so it isn't sent
-                        // output it would have to drain.
-                        if (client.watches_status) continue;
                         ipc.appendMessage(gpa, &client.write_buf, .Output, broadcast_data) catch |err| {
                             std.log.warn(
                                 "failed to buffer output for client err={s}",
@@ -616,7 +613,6 @@ pub const Client = struct {
     socket_fd: i32,
     has_pending_output: bool = false,
     is_terminal: bool = false, // sent .Init (a `zmx attach`), not a run/send/tail client
-    watches_status: bool = false, // sent .ProgramStatus; receives status changes and no output
     read_buf: ipc.SocketBuffer,
     write_buf: std.ArrayList(u8),
     env_str: ?[]u8 = null,
@@ -1327,7 +1323,6 @@ pub const Daemon = struct {
         self.setPwd(term);
         self.has_pty_output = true;
         for (self.clients.items) |client| {
-            if (client.watches_status) continue;
             try ipc.appendMessage(gpa, &client.write_buf, .Output, payload);
             client.has_pending_output = true;
         }
@@ -1403,7 +1398,6 @@ pub const Daemon = struct {
     }
 
     fn handleProgramStatus(self: *Daemon, gpa: std.mem.Allocator, client: *Client) !void {
-        client.watches_status = true;
         try ipc.appendMessage(gpa, &client.write_buf, .ProgramStatus, self.program_status.items);
         client.has_pending_output = true;
     }
@@ -1415,8 +1409,8 @@ pub const Daemon = struct {
             std.log.warn("failed to keep program status err={s}", .{@errorName(err)});
             return;
         };
+        // Every client hears about the change, as with TaskComplete.
         for (self.clients.items) |client| {
-            if (!client.watches_status) continue;
             ipc.appendMessage(gpa, &client.write_buf, .ProgramStatus, body) catch |err| {
                 std.log.warn("failed to buffer program status err={s}", .{@errorName(err)});
                 continue;
@@ -1667,8 +1661,23 @@ test "daemon keeps the program's OSC 7501 status and answers only its probe" {
     vt.stream.nextSlice("\x1b[6n\x1b[>q\x1b[?2004$p");
     try std.testing.expectEqual(@as(usize, 0), daemon.pty_write_buf.items.len);
 
+    // Every client hears about a change, attached terminal or not.
+    const fds = try lib_posix.pipe2(.{});
+    defer lib_posix.close(fds[1]);
+    var client = Client{
+        .alloc = alloc,
+        .socket_fd = fds[0],
+        .read_buf = try ipc.SocketBuffer.init(alloc),
+        .write_buf = std.ArrayList(u8).empty,
+    };
+    defer client.deinit(alloc);
+    try daemon.clients.append(alloc, &client);
+
     vt.stream.nextSlice("\x1b]7501;state=working:app=claude-code\x07");
     try std.testing.expectEqualStrings("state=working:app=claude-code", daemon.program_status.items);
+    const header = std.mem.bytesToValue(ipc.Header, client.write_buf.items[0..@sizeOf(ipc.Header)]);
+    try std.testing.expectEqual(ipc.Tag.ProgramStatus, header.tag);
+    try std.testing.expectEqualStrings("state=working:app=claude-code", client.write_buf.items[@sizeOf(ipc.Header)..]);
 
     // A record with an id is part of the program's work, not the program.
     vt.stream.nextSlice("\x1b]7501;state=done:id=sub\x1b\\");
