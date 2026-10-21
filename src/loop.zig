@@ -414,6 +414,9 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
                     const broadcast_data = util.rewritePromptRedraw(gpa, buf[0..n]) orelse buf[0..n];
                     defer if (broadcast_data.ptr != buf[0..n].ptr) gpa.free(broadcast_data);
                     for (daemon.clients.items) |client| {
+                        // A status watcher reads only status, so it isn't sent
+                        // output it would have to drain.
+                        if (client.watches_status) continue;
                         ipc.appendMessage(gpa, &client.write_buf, .Output, broadcast_data) catch |err| {
                             std.log.warn(
                                 "failed to buffer output for client err={s}",
@@ -613,7 +616,7 @@ pub const Client = struct {
     socket_fd: i32,
     has_pending_output: bool = false,
     is_terminal: bool = false, // sent .Init (a `zmx attach`), not a run/send/tail client
-    watches_status: bool = false, // sent .ProgramStatus; receives each status change
+    watches_status: bool = false, // sent .ProgramStatus; receives status changes and no output
     read_buf: ipc.SocketBuffer,
     write_buf: std.ArrayList(u8),
     env_str: ?[]u8 = null,
@@ -1324,6 +1327,7 @@ pub const Daemon = struct {
         self.setPwd(term);
         self.has_pty_output = true;
         for (self.clients.items) |client| {
+            if (client.watches_status) continue;
             try ipc.appendMessage(gpa, &client.write_buf, .Output, payload);
             client.has_pending_output = true;
         }
