@@ -246,8 +246,10 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
     const init_size = ipc.getTerminalSize(pty_fd);
     var term = try initTerminal(gpa, io, init_size, daemon.cfg);
     defer term.deinit(gpa);
-    var vt_stream = term.vtStream();
-    defer vt_stream.deinit();
+    var vt: Vt = .{ .daemon = daemon, .gpa = gpa, .stream = undefined };
+    vt.stream = .init(.{ .allocator = gpa, .handler = Vt.handler(&term) });
+    defer vt.stream.deinit();
+    const vt_stream = &vt.stream;
 
     // Carries the tail of the previous PTY read so the task-exit marker
     // search below can see across a read() boundary. Sized to comfortably
@@ -478,7 +480,8 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
                     switch (msg.header.tag) {
                         .Input => try daemon.handleInput(gpa, client, msg.payload),
                         .Send => daemon.handleSend(gpa, msg.payload),
-                        .Output => try daemon.handleOutput(gpa, msg.payload, &term, &vt_stream),
+                        .Output => try daemon.handleOutput(gpa, msg.payload, &term, vt_stream),
+                        .ProgramStatus => try daemon.handleProgramStatus(gpa, client),
                         .Init => try daemon.handleInit(gpa, client, pty_fd, &term, msg.payload),
                         .Switch => try daemon.handleSwitch(gpa, msg.payload),
                         .Resize => try daemon.handleResize(gpa, client, pty_fd, &term, msg.payload),
@@ -549,6 +552,50 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
     }
 }
 
+/// The daemon's VT stream. The handler sits inside the stream, so its
+/// effect callbacks find the daemon through `fromHandler`. Must not move
+/// after `stream` is initialized.
+const Vt = struct {
+    daemon: *Daemon,
+    gpa: std.mem.Allocator,
+    stream: ghostty_vt.TerminalStream,
+
+    const Handler = ghostty_vt.TerminalStream.Handler;
+    const ProgramStatusReport = ghostty_vt.osc.Command.ProgramStatus.Report;
+
+    fn handler(term: *ghostty_vt.Terminal) Handler {
+        var h = term.vtHandler();
+        h.effects.program_status = &onProgramStatus;
+        h.effects.write_pty = &onWritePty;
+        return h;
+    }
+
+    fn fromHandler(h: *Handler) *Vt {
+        const stream: *ghostty_vt.TerminalStream = @fieldParentPtr("handler", h);
+        return @alignCast(@fieldParentPtr("stream", stream));
+    }
+
+    /// ghostty-vt sends every query reply through this one effect, and
+    /// setting `program_status` is what makes it answer the OSC 7501
+    /// support query. Only that reply goes to the program. The other
+    /// queries (DSR, DECRQM, XTVERSION, ...) are left to the attached
+    /// terminal, as before; a second answer would reach the program as
+    /// typed input.
+    fn onWritePty(h: *Handler, data: []const u8) void {
+        if (!std.mem.startsWith(u8, data, "\x1b]7501;?")) return;
+        const self = fromHandler(h);
+        self.daemon.queuePtyInput(self.gpa, data);
+    }
+
+    /// Keeps the program's own record, the one without an id. Records with
+    /// an id describe parts of its work (`deploy/us-east`) and aren't kept.
+    fn onProgramStatus(h: *Handler, report: ProgramStatusReport) void {
+        if (report.readOption(.id) != null) return;
+        const self = fromHandler(h);
+        self.daemon.setProgramStatus(self.gpa, if (report.state == .clear) "" else report.data);
+    }
+};
+
 const ClientResult = struct {
     kind: enum {
         detach,
@@ -566,6 +613,7 @@ pub const Client = struct {
     socket_fd: i32,
     has_pending_output: bool = false,
     is_terminal: bool = false, // sent .Init (a `zmx attach`), not a run/send/tail client
+    watches_status: bool = false, // sent .ProgramStatus; receives each status change
     read_buf: ipc.SocketBuffer,
     write_buf: std.ArrayList(u8),
     env_str: ?[]u8 = null,
@@ -599,6 +647,10 @@ pub const Daemon = struct {
     pty_write_buf: std.ArrayList(u8) = .empty,
     clients: std.ArrayList(*Client) = .empty,
     labels: std.StringHashMapUnmanaged([]u8) = .empty,
+    /// The program's latest OSC 7501 report for its own record: everything
+    /// after `7501;`, already validated by ghostty-vt. Empty when it never
+    /// reported, cleared its record, or the terminal was reset.
+    program_status: std.ArrayList(u8) = .empty,
     // This control which client is the leader.  The leader controls terminal state and
     // cols/rows of session.
     leader_client_fd: ?i32 = null,
@@ -645,6 +697,7 @@ pub const Daemon = struct {
             gpa.free(entry.value_ptr.*);
         }
         self.labels.deinit(gpa);
+        self.program_status.deinit(gpa);
         self.pty_write_buf.deinit(gpa);
         gpa.free(self.socket_path);
     }
@@ -1345,6 +1398,29 @@ pub const Daemon = struct {
         client.has_pending_output = true;
     }
 
+    fn handleProgramStatus(self: *Daemon, gpa: std.mem.Allocator, client: *Client) !void {
+        client.watches_status = true;
+        try ipc.appendMessage(gpa, &client.write_buf, .ProgramStatus, self.program_status.items);
+        client.has_pending_output = true;
+    }
+
+    fn setProgramStatus(self: *Daemon, gpa: std.mem.Allocator, body: []const u8) void {
+        if (std.mem.eql(u8, self.program_status.items, body)) return;
+        self.program_status.clearRetainingCapacity();
+        self.program_status.appendSlice(gpa, body) catch |err| {
+            std.log.warn("failed to keep program status err={s}", .{@errorName(err)});
+            return;
+        };
+        for (self.clients.items) |client| {
+            if (!client.watches_status) continue;
+            ipc.appendMessage(gpa, &client.write_buf, .ProgramStatus, body) catch |err| {
+                std.log.warn("failed to buffer program status err={s}", .{@errorName(err)});
+                continue;
+            };
+            client.has_pending_output = true;
+        }
+    }
+
     fn handleLabelGet(self: *Daemon, gpa: std.mem.Allocator, client: *Client) !void {
         const out = try label.labelsToU8(gpa, self.labels);
         defer gpa.free(out);
@@ -1564,4 +1640,48 @@ test "handleEnvGet returns leader client's environment variables including unset
     try daemon.handleEnvGet(alloc, &client_req);
     const pay3 = client_req.write_buf.items[@sizeOf(ipc.Header)..];
     try std.testing.expectEqualStrings("DISPLAY=:99\n", pay3);
+}
+
+test "daemon keeps the program's OSC 7501 status and answers only its probe" {
+    const alloc = std.testing.allocator;
+    var cfg = Cfg{ .socket_dir = "", .log_dir = "" };
+    var daemon = Daemon.init(std.testing.io, &cfg, "test", try alloc.dupe(u8, "/tmp/zmx-test"));
+    defer daemon.deinit(alloc);
+    var term = try initTerminal(alloc, std.testing.io, .{ .cols = 80, .rows = 24 }, &cfg);
+    defer term.deinit(alloc);
+    var vt: Vt = .{ .daemon = &daemon, .gpa = alloc, .stream = undefined };
+    vt.stream = .init(.{ .allocator = alloc, .handler = Vt.handler(&term) });
+    defer vt.stream.deinit();
+
+    // The probe is answered with the terminator it used.
+    vt.stream.nextSlice("\x1b]7501;?\x1b\\");
+    try std.testing.expectStringStartsWith(daemon.pty_write_buf.items, "\x1b]7501;?:states=");
+    try std.testing.expectStringEndsWith(daemon.pty_write_buf.items, "\x1b\\");
+    daemon.pty_write_buf.clearRetainingCapacity();
+
+    // Other queries are left to the attached terminal.
+    vt.stream.nextSlice("\x1b[6n\x1b[>q\x1b[?2004$p");
+    try std.testing.expectEqual(@as(usize, 0), daemon.pty_write_buf.items.len);
+
+    vt.stream.nextSlice("\x1b]7501;state=working:app=claude-code\x07");
+    try std.testing.expectEqualStrings("state=working:app=claude-code", daemon.program_status.items);
+
+    // A record with an id is part of the program's work, not the program.
+    vt.stream.nextSlice("\x1b]7501;state=done:id=sub\x1b\\");
+    try std.testing.expectEqualStrings("state=working:app=claude-code", daemon.program_status.items);
+
+    // An invalid report is dropped as a whole.
+    vt.stream.nextSlice("\x1b]7501;state=sleeping\x1b\\");
+    try std.testing.expectEqualStrings("state=working:app=claude-code", daemon.program_status.items);
+
+    vt.stream.nextSlice("\x1b]7501;state=blocked:kind=permission\x1b\\");
+    try std.testing.expectEqualStrings("state=blocked:kind=permission", daemon.program_status.items);
+
+    vt.stream.nextSlice("\x1b]7501;state=clear\x1b\\");
+    try std.testing.expectEqualStrings("", daemon.program_status.items);
+
+    // A full reset clears it too.
+    vt.stream.nextSlice("\x1b]7501;state=done\x1b\\");
+    vt.stream.nextSlice("\x1bc");
+    try std.testing.expectEqualStrings("", daemon.program_status.items);
 }

@@ -31,6 +31,12 @@ pub const Tag = enum(u8) {
     /// Scoped history: the active screen plus a bounded number of
     /// preceding scrollback rows. Request payload is `Capture`.
     Capture = 22,
+    /// The program's OSC 7501 status. A client sends it (empty payload) to
+    /// watch the status; the daemon answers with the current report body
+    /// (everything after `7501;`, empty when there is none) and sends it
+    /// again whenever it changes. Watching doesn't make a client a
+    /// terminal, so the daemon keeps answering DA queries for the program.
+    ProgramStatus = 23,
     Unsupported = 255,
     // Non-exhaustive: this enum comes off the wire via bytesToValue and
     // @enumFromInt, so out-of-range values are representable
