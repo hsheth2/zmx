@@ -37,6 +37,9 @@ pub const Tag = enum(u8) {
     /// payload) to get the current status; that doesn't make the client a
     /// terminal, so the daemon keeps answering DA queries for the program.
     ProgramStatus = 23,
+    /// The terminal title the program set (OSC 0/2), empty when there is
+    /// none. Sent and requested like ProgramStatus.
+    Title = 24,
     Unsupported = 255,
     // Non-exhaustive: this enum comes off the wire via bytesToValue and
     // @enumFromInt, so out-of-range values are representable
@@ -362,7 +365,8 @@ test "Tag wire values are frozen" {
         .{ Tag.Write, 12 },    .{ Tag.TaskComplete, 13 }, .{ Tag.LabelGet, 14 },
         .{ Tag.LabelSet, 15 }, .{ Tag.LabelClear, 16 },   .{ Tag.LabelData, 17 },
         .{ Tag.Send, 18 },     .{ Tag.EnvGet, 19 },       .{ Tag.EnvSet, 20 },
-        .{ Tag.EnvData, 21 },  .{ Tag.Capture, 22 },      .{ Tag.Unsupported, 255 },
+        .{ Tag.EnvData, 21 },  .{ Tag.Capture, 22 },      .{ Tag.ProgramStatus, 23 },
+        .{ Tag.Title, 24 },    .{ Tag.Unsupported, 255 },
     }) |p| try std.testing.expectEqual(@as(u8, p[1]), @intFromEnum(p[0]));
 }
 

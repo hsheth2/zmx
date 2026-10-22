@@ -481,7 +481,8 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
                         .Input => try daemon.handleInput(gpa, client, msg.payload),
                         .Send => daemon.handleSend(gpa, msg.payload),
                         .Output => try daemon.handleOutput(gpa, msg.payload, &term, vt_stream),
-                        .ProgramStatus => try daemon.handleProgramStatus(gpa, client),
+                        .ProgramStatus => try daemon.program_status.send(gpa, client),
+                        .Title => try daemon.title.send(gpa, client),
                         .Init => try daemon.handleInit(gpa, client, pty_fd, &term, msg.payload),
                         .Switch => try daemon.handleSwitch(gpa, msg.payload),
                         .Resize => try daemon.handleResize(gpa, client, pty_fd, &term, msg.payload),
@@ -566,6 +567,8 @@ const Vt = struct {
     fn handler(term: *ghostty_vt.Terminal) Handler {
         var h = term.vtHandler();
         h.effects.program_status = &onProgramStatus;
+        h.effects.title_changed = &onTitleChanged;
+        h.effects.reset = &onReset;
         h.effects.write_pty = &onWritePty;
         return h;
     }
@@ -592,7 +595,32 @@ const Vt = struct {
     fn onProgramStatus(h: *Handler, report: ProgramStatusReport) void {
         if (report.readOption(.id) != null) return;
         const self = fromHandler(h);
-        self.daemon.setProgramStatus(self.gpa, if (report.state == .clear) "" else report.data);
+        self.daemon.setReport(self.gpa, &self.daemon.program_status, if (report.state == .clear) "" else report.data);
+    }
+
+    fn onTitleChanged(h: *Handler) void {
+        const self = fromHandler(h);
+        self.daemon.setReport(self.gpa, &self.daemon.title, h.terminal.getTitle() orelse "");
+    }
+
+    /// A full reset clears the title without calling `title_changed`.
+    /// (It reports the program status as cleared before this.)
+    fn onReset(h: *Handler) void {
+        const self = fromHandler(h);
+        self.daemon.setReport(self.gpa, &self.daemon.title, "");
+    }
+};
+
+/// Something the program reports through escape sequences, which the
+/// daemon keeps so clients can ask for it and sends to every client when
+/// it changes. Empty when there is nothing to report.
+const Report = struct {
+    tag: ipc.Tag,
+    value: std.ArrayList(u8) = .empty,
+
+    fn send(self: *const Report, gpa: std.mem.Allocator, client: *Client) !void {
+        try ipc.appendMessage(gpa, &client.write_buf, self.tag, self.value.items);
+        client.has_pending_output = true;
     }
 };
 
@@ -649,7 +677,8 @@ pub const Daemon = struct {
     /// The program's latest OSC 7501 report for its own record: everything
     /// after `7501;`, already validated by ghostty-vt. Empty when it never
     /// reported, cleared its record, or the terminal was reset.
-    program_status: std.ArrayList(u8) = .empty,
+    program_status: Report = .{ .tag = .ProgramStatus },
+    title: Report = .{ .tag = .Title },
     // This control which client is the leader.  The leader controls terminal state and
     // cols/rows of session.
     leader_client_fd: ?i32 = null,
@@ -696,7 +725,8 @@ pub const Daemon = struct {
             gpa.free(entry.value_ptr.*);
         }
         self.labels.deinit(gpa);
-        self.program_status.deinit(gpa);
+        self.program_status.value.deinit(gpa);
+        self.title.value.deinit(gpa);
         self.pty_write_buf.deinit(gpa);
         gpa.free(self.socket_path);
     }
@@ -1397,22 +1427,17 @@ pub const Daemon = struct {
         client.has_pending_output = true;
     }
 
-    fn handleProgramStatus(self: *Daemon, gpa: std.mem.Allocator, client: *Client) !void {
-        try ipc.appendMessage(gpa, &client.write_buf, .ProgramStatus, self.program_status.items);
-        client.has_pending_output = true;
-    }
-
-    fn setProgramStatus(self: *Daemon, gpa: std.mem.Allocator, body: []const u8) void {
-        if (std.mem.eql(u8, self.program_status.items, body)) return;
-        self.program_status.clearRetainingCapacity();
-        self.program_status.appendSlice(gpa, body) catch |err| {
-            std.log.warn("failed to keep program status err={s}", .{@errorName(err)});
+    fn setReport(self: *Daemon, gpa: std.mem.Allocator, report: *Report, body: []const u8) void {
+        if (std.mem.eql(u8, report.value.items, body)) return;
+        report.value.clearRetainingCapacity();
+        report.value.appendSlice(gpa, body) catch |err| {
+            std.log.warn("failed to keep {s} err={s}", .{ @tagName(report.tag), @errorName(err) });
             return;
         };
         // Every client hears about the change, as with TaskComplete.
         for (self.clients.items) |client| {
-            ipc.appendMessage(gpa, &client.write_buf, .ProgramStatus, body) catch |err| {
-                std.log.warn("failed to buffer program status err={s}", .{@errorName(err)});
+            ipc.appendMessage(gpa, &client.write_buf, report.tag, body) catch |err| {
+                std.log.warn("failed to buffer {s} err={s}", .{ @tagName(report.tag), @errorName(err) });
                 continue;
             };
             client.has_pending_output = true;
@@ -1640,7 +1665,7 @@ test "handleEnvGet returns leader client's environment variables including unset
     try std.testing.expectEqualStrings("DISPLAY=:99\n", pay3);
 }
 
-test "daemon keeps the program's OSC 7501 status and answers only its probe" {
+test "daemon keeps the program's OSC 7501 status and title and answers only its probe" {
     const alloc = std.testing.allocator;
     var cfg = Cfg{ .socket_dir = "", .log_dir = "" };
     var daemon = Daemon.init(std.testing.io, &cfg, "test", try alloc.dupe(u8, "/tmp/zmx-test"));
@@ -1674,27 +1699,39 @@ test "daemon keeps the program's OSC 7501 status and answers only its probe" {
     try daemon.clients.append(alloc, &client);
 
     vt.stream.nextSlice("\x1b]7501;state=working:app=claude-code\x07");
-    try std.testing.expectEqualStrings("state=working:app=claude-code", daemon.program_status.items);
+    try std.testing.expectEqualStrings("state=working:app=claude-code", daemon.program_status.value.items);
     const header = std.mem.bytesToValue(ipc.Header, client.write_buf.items[0..@sizeOf(ipc.Header)]);
     try std.testing.expectEqual(ipc.Tag.ProgramStatus, header.tag);
     try std.testing.expectEqualStrings("state=working:app=claude-code", client.write_buf.items[@sizeOf(ipc.Header)..]);
 
     // A record with an id is part of the program's work, not the program.
     vt.stream.nextSlice("\x1b]7501;state=done:id=sub\x1b\\");
-    try std.testing.expectEqualStrings("state=working:app=claude-code", daemon.program_status.items);
+    try std.testing.expectEqualStrings("state=working:app=claude-code", daemon.program_status.value.items);
 
     // An invalid report is dropped as a whole.
     vt.stream.nextSlice("\x1b]7501;state=sleeping\x1b\\");
-    try std.testing.expectEqualStrings("state=working:app=claude-code", daemon.program_status.items);
+    try std.testing.expectEqualStrings("state=working:app=claude-code", daemon.program_status.value.items);
 
     vt.stream.nextSlice("\x1b]7501;state=blocked:kind=permission\x1b\\");
-    try std.testing.expectEqualStrings("state=blocked:kind=permission", daemon.program_status.items);
+    try std.testing.expectEqualStrings("state=blocked:kind=permission", daemon.program_status.value.items);
 
     vt.stream.nextSlice("\x1b]7501;state=clear\x1b\\");
-    try std.testing.expectEqualStrings("", daemon.program_status.items);
+    try std.testing.expectEqualStrings("", daemon.program_status.value.items);
 
-    // A full reset clears it too.
-    vt.stream.nextSlice("\x1b]7501;state=done\x1b\\");
+    // A full reset clears it, and the title.
+    vt.stream.nextSlice("\x1b]7501;state=done\x1b\\\x1b]2;my title\x07");
+    try std.testing.expectEqualStrings("my title", daemon.title.value.items);
     vt.stream.nextSlice("\x1bc");
-    try std.testing.expectEqualStrings("", daemon.program_status.items);
+    try std.testing.expectEqualStrings("", daemon.program_status.value.items);
+    try std.testing.expectEqualStrings("", daemon.title.value.items);
+
+    // Title changes go to every client like status changes, and a client
+    // can ask for the current title.
+    client.write_buf.clearRetainingCapacity();
+    vt.stream.nextSlice("\x1b]0;other\x07");
+    try daemon.title.send(alloc, &client);
+    const h1 = std.mem.bytesToValue(ipc.Header, client.write_buf.items[0..@sizeOf(ipc.Header)]);
+    try std.testing.expectEqual(ipc.Tag.Title, h1.tag);
+    try std.testing.expectEqualStrings("other", client.write_buf.items[@sizeOf(ipc.Header)..][0..h1.len]);
+    try std.testing.expectEqualStrings("other", client.write_buf.items[2 * @sizeOf(ipc.Header) + h1.len ..]);
 }
